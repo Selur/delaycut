@@ -22,23 +22,14 @@
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
-#include <string.h>
-
 
 int main(int argc, char *argv[])
 {
 
     QApplication a(argc, argv);
-    DelayCut w(argc, argv);
+    DelayCut w;
 
-    bool isGUI = argc < 3;
-
-    if (argc == 2 && argv[1][0] == '-' &&
-       (strcmp("-help", argv[1]) == 0 || strcmp("--help", argv[1]) == 0 ||
-        strcmp("-version", argv[1]) == 0 || strcmp("--version", argv[1]) == 0))
-    {
-        isGUI = false;
-    }
+    bool isGUI = argc < 2;
 
     if (isGUI)
     {
@@ -51,6 +42,5 @@ int main(int argc, char *argv[])
     {
         w.execCLI(argc);
     }
-
     return a.exec();
 }

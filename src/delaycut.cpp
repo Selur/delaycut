@@ -2,7 +2,7 @@
     2007-09-11 E-AC3 support added by www.madshi.net
     2009 Chumbo mod to autofill delay values from filename
     Copyright (C) 2010 by Adam Thomas-Murphy
-    Copyright (C) 2014-2023 by djcj <djcj@gmx.de>
+    Copyright (C) 2014, 2016-2017 by djcj <djcj@gmx.de>
 
     This file is part of DelayCut.
 
@@ -22,8 +22,7 @@
 
 #include "delaycut.h"
 #include "ui_delaycut.h"
-
-#if QT_VERSION < 0x060000
+#if (QT_VERSION < QT_VERSION_CHECK(6, 0, 0))
 #include <QDesktopWidget>
 #endif
 #include <QIntValidator>
@@ -33,31 +32,27 @@
 #include <QMessageBox>
 #include <QFontMetrics>
 #include <QStringList>
+#include <cmath>
 #include <QThread>
-#include <QFlags>
 
 #include <wchar.h>
 #include "delayac3.h"
 #include "dc_types.h"
 
-#include <cmath>
 #include <cstdio>
 #include <cinttypes>
 
 #ifdef Q_OS_WIN
-#include <windows.h>
-#include <io.h>
-#include <fcntl.h>
-#define ICON_RES ":/icon.ico"
-#else
-#define ICON_RES ":/icon.png"
+#include "windows.h"
+#include "io.h"
+#include "fcntl.h"
 #endif
 
-
-DelayCut::DelayCut(int argc, char *argv[], QWidget *parent) :
+DelayCut::DelayCut(QWidget *parent) :
     QMainWindow(parent),
     ui(new Ui::DelayCut),
     crcMode("IGNORED"),
+    abort(false),
     isCLI(false),
     writeConsole(false),
     currentInputMode("milliseconds"),
@@ -65,29 +60,30 @@ DelayCut::DelayCut(int argc, char *argv[], QWidget *parent) :
     endCut(0),
     startDelay(0),
     endDelay(0),
-    startSilence(0),
-    lengthSilence(0),
     fps(29.97),
     inFileName(""),
     outFileName(""),
     logFileName(""),
-    workerThread(new QThread()),
     versionString("delaycut v" VERSION)
 {
     ui->setupUi(this);
+    delayac3 = new Delayac3;
+    delayac3->ac3_crc_init();
     stringModel = new QStringListModel;
     fileInfo = new FILEINFO;
     this->setWindowTitle(versionString);
-    this->setWindowIcon(QIcon(ICON_RES));
-
-#if QT_VERSION < 0x060000
-    /* deprecated */
-    this->setGeometry(QStyle::alignedRect(Qt::LeftToRight, Qt::AlignCenter, this->size(), qApp->desktop()->availableGeometry()));
+#ifdef Q_OS_WIN
+    this->setWindowIcon(QIcon(":/icon.ico"));
+#else
+    this->setWindowIcon(QIcon(":/icon.png"));
 #endif
 
-    if(argc > 1) {
-        ui->inputFileLineEdit->setText(argv[1]);
-    }
+#if (QT_VERSION < QT_VERSION_CHECK(6, 0, 0))
+    this->setGeometry(QStyle::alignedRect(Qt::LeftToRight, Qt::AlignCenter, this->size(), qApp->desktop()->availableGeometry()));
+#else
+    this->setGeometry(QStyle::alignedRect(Qt::LeftToRight, Qt::AlignCenter, this->size(), QGuiApplication::primaryScreen()->geometry()));
+#endif
+
     delayValidator = new QIntValidator(-9999999, 99999999, this);
     cutValidator = new QIntValidator(0, 99999999, this);
     ui->startCuttingLineEdit->setValidator(cutValidator);
@@ -98,10 +94,6 @@ DelayCut::DelayCut(int argc, char *argv[], QWidget *parent) :
     ui->startDelayLineEdit->setText(QString::number((int) startDelay));
     ui->endDelayLineEdit->setValidator(delayValidator);
     ui->endDelayLineEdit->setText(QString::number((int) endDelay));
-    ui->startSilenceLineEdit->setValidator(cutValidator);
-    ui->startSilenceLineEdit->setText(QString::number((int) startSilence));
-    ui->lengthSilenceLineEdit->setValidator(cutValidator);
-    ui->lengthSilenceLineEdit->setText(QString::number((int) lengthSilence));
 
     fpsValidator = new QRegularExpressionValidator(QRegularExpression("[0-9]{1,6}[/|.][0-9]{1,4}"), this);
     ui->fpsLineEdit->setValidator(fpsValidator);
@@ -113,6 +105,11 @@ DelayCut::DelayCut(int argc, char *argv[], QWidget *parent) :
     QFont font("Monospace");
     font.setStyleHint(QFont::TypeWriter);
     ui->infoTextEdit->setFont(font);
+
+    workerThread = new QThread;
+
+    connect(delayac3, SIGNAL(UpdateProgress(qint32)), this, SLOT(onUpdateProgress(qint32)));
+    connect(delayac3, SIGNAL(ProcessingFinished(bool)), this, SLOT(onProcessingFinished(bool)));
 }
 
 DelayCut::~DelayCut()
@@ -147,26 +144,24 @@ void DelayCut::printHelp()
     fprintf(stdout, "%s\n", "Output and log files will be in the same path than the input file.");
     fprintf(stdout, "%s\n", "");
     fprintf(stdout, "%s\n", "Options:");
-    fprintf(stdout, "%s\n", "-help:                    List options.");
-    fprintf(stdout, "%s\n", "-version:                 Get current version.");
-    fprintf(stdout, "%s\n", "-info:                    Outputs info about input file in log file");
-    fprintf(stdout, "%s\n", "-inputtype <string>:      Input type of delay/cut values. (default millseconds");
-    fprintf(stdout, "%s\n", "                          when not specified) [milliseconds, seconds, videoframes]");
-    fprintf(stdout, "%s\n", "-fps <float|rational>:    Specify frame rate.");
-    fprintf(stdout, "%s\n", "                          Needed when inputtype is set to frames.");
-    fprintf(stdout, "%s\n", "-fixcrc <string>:         Specify action to take in the case of crc errors");
-    fprintf(stdout, "%s\n", "                          [ignore, skip, fix, silence]");
-    fprintf(stdout, "%s\n", "-startdelay <integer>:    Specify the needed frames added at the beginning of the file");
-    fprintf(stdout, "%s\n", "-delay <integer>:         Alias for -startdelay");
-    fprintf(stdout, "%s\n", "-enddelay <integer>:      Specify the needed frames added at the end of the file");
-    fprintf(stdout, "%s\n", "-startsilence <integer>:  Specify the silence start");
-    fprintf(stdout, "%s\n", "-lengthsilence <integer>: Specify the silence length");
-    fprintf(stdout, "%s\n", "-same:                    file length will be the same after adding delay");
-    fprintf(stdout, "%s\n", "-auto:                    detect start delay in filename (assuming DVD2AVI style)");
-    fprintf(stdout, "%s\n", "-startcut <integer>:      Specify cut start point");
-    fprintf(stdout, "%s\n", "-endcut <integer>:        Specify cut end point");
-    fprintf(stdout, "%s\n", "-o <string>:              specify output file");
-    fprintf(stdout, "%s\n", "-i <string>:              specify inputfile");
+    fprintf(stdout, "%s\n", "-help:                 List options.");
+    fprintf(stdout, "%s\n", "-version:              Get current version.");
+    fprintf(stdout, "%s\n", "-info:                 Outputs info about input file in log file");
+    fprintf(stdout, "%s\n", "-inputtype <string>:   Input type of delay/cut values. (default millseconds");
+    fprintf(stdout, "%s\n", "                       when not specified) [milliseconds, seconds, videoframes]");
+    fprintf(stdout, "%s\n", "-fps <float|rational>: Specify frame rate.");
+    fprintf(stdout, "%s\n", "                       Needed when inputtype is set to frames.");
+    fprintf(stdout, "%s\n", "-fixcrc <string>:      Specify action to take in the case of crc errors");
+    fprintf(stdout, "%s\n", "                       [ignore, skip, fix, silence]");
+    fprintf(stdout, "%s\n", "-startdelay <integer>: Specify the needed frames added at the beginning of the file");
+    fprintf(stdout, "%s\n", "-delay <integer>:      Alias for -startdelay");
+    fprintf(stdout, "%s\n", "-enddelay <integer>:   Specify the needed frames added at the end of the file");
+    fprintf(stdout, "%s\n", "-same:                 file length will be the same after adding delay");
+    fprintf(stdout, "%s\n", "-auto:                 detect start delay in filename (assuming DVD2AVI style)");
+    fprintf(stdout, "%s\n", "-startcut <integer>:   Specify cut start point");
+    fprintf(stdout, "%s\n", "-endcut <integer>:     Specify cut end point");
+    fprintf(stdout, "%s\n", "-o <string>:           specify output file");
+    fprintf(stdout, "%s\n", "-i <string>:           specify inputfile");
     fprintf(stdout, "%s\n", "");
     fprintf(stdout, "%s\n", "Examples:");
     fprintf(stdout, "%s\n", "Get info: Log file will be myfile_log.txt");
@@ -211,7 +206,7 @@ void DelayCut::execCLI(int argc)
 
     fps = 29997/1001;
 
-    startDelay = endDelay = startCut = endCut = startSilence = lengthSilence = 0;
+    startDelay = endDelay = startCut = endCut = 0;
     for (int i = 1; i < argc; ++i)
     {
         parameter = args.at(i).toLower();
@@ -251,11 +246,7 @@ void DelayCut::execCLI(int argc)
             }
             if (fpsParam.contains("/"))
             {
-#if QT_VERSION < 0x051000
-                QStringList fpsList = fpsParam.split('/', QString::SkipEmptyParts);
-#else
                 QStringList fpsList = fpsParam.split('/', Qt::SkipEmptyParts);
-#endif
                 if (fpsList.count() == 2 && fpsList.at(1) != "0")
                 {
                     fps = (fpsList.at(0).toDouble() / fpsList.at(1).toDouble());
@@ -268,7 +259,7 @@ void DelayCut::execCLI(int argc)
             }
             else
             {
-                if (sscanf(fpsParam.toUtf8().constData(), "%lf", &fps) != 1)
+                if (sscanf(fpsParam.toLatin1().constData(), "%lf", &fps) != 1)
                 {
                     fprintf(stderr, "No valid fps value specified.\n");
                     exit(EXIT_FAILURE);
@@ -297,7 +288,7 @@ void DelayCut::execCLI(int argc)
         else if ((parameter == "-startdelay" || parameter == "-delay") && i < (argc - 1))
         {
             i++;
-            if (sscanf(args.at(i).toUtf8().constData(), "%lf", &startDelay) != 1)
+            if (sscanf(args.at(i).toLatin1().constData(), "%lf", &startDelay) != 1)
             {
                 fprintf(stderr, "No valid start delay value specified.\n");
                 exit(EXIT_FAILURE);
@@ -306,7 +297,7 @@ void DelayCut::execCLI(int argc)
         else if (parameter == "-enddelay" && i < (argc - 1))
         {
             i++;
-            if (sscanf(args.at(i).toUtf8().constData(), "%lf", &endDelay) != 1)
+            if (sscanf(args.at(i).toLatin1().constData(), "%lf", &endDelay) != 1)
             {
                 fprintf(stderr, "No valid end delay value specified.\n");
                 exit(EXIT_FAILURE);
@@ -315,7 +306,7 @@ void DelayCut::execCLI(int argc)
         else if (parameter == "-startcut" && i < (argc - 1))
         {
             i++;
-            if (sscanf(args.at(i).toUtf8().constData(), "%lf", &startCut) != 1)
+            if (sscanf(args.at(i).toLatin1().constData(), "%lf", &startCut) != 1)
             {
                 fprintf(stderr, "No valid start cut value specified.\n");
                 exit(EXIT_FAILURE);
@@ -325,29 +316,9 @@ void DelayCut::execCLI(int argc)
         else if (parameter == "-endcut" && i < (argc - 1))
         {
             i++;
-            if (sscanf(args.at(i).toUtf8().constData(), "%lf", &endCut) != 1)
+            if (sscanf(args.at(i).toLatin1().constData(), "%lf", &endCut) != 1)
             {
                 fprintf(stderr, "No valid end cut value specified.\n");
-                exit(EXIT_FAILURE);
-            }
-            isCut = true;
-        }
-        else if (parameter == "-startsilence" && i < (argc - 1))
-        {
-            i++;
-            if (sscanf(args.at(i).toUtf8().constData(), "%lf", &startSilence) != 1)
-            {
-                fprintf(stderr, "No valid start silence value specified.\n");
-                exit(EXIT_FAILURE);
-            }
-            isCut = true;
-        }
-        else if (parameter == "-lengthsilence" && i < (argc - 1))
-        {
-            i++;
-            if (sscanf(args.at(i).toUtf8().constData(), "%lf", &lengthSilence) != 1)
-            {
-                fprintf(stderr, "No valid silence length value specified.\n");
                 exit(EXIT_FAILURE);
             }
             isCut = true;
@@ -479,12 +450,12 @@ void DelayCut::execCLI(int argc)
                     {
                         fps = ui->fpsLineEdit->text().toDouble();
                     }
-                    startDelay = Delayac3::round((delay / 1000.0) * fps);
+                    startDelay = delayac3->round((delay / 1000.0) * fps);
                     ui->startDelayLineEdit->setText(QString::number(startDelay));
                 }
                 else if (currentInputMode == "audioframes")
                 {
-                    startDelay = Delayac3::round(delay / fileInfo->dFrameduration);
+                    startDelay = delayac3->round(delay / fileInfo->dFrameduration);
                     ui->startDelayLineEdit->setText(QString::number((int) startDelay));
                 }
                 else
@@ -509,7 +480,7 @@ void DelayCut::execCLI(int argc)
             checkVal = endCut * fps;
             if (checkVal > length)
             {
-                endCut = Delayac3::round(length * fps);
+                endCut = delayac3->round(length * fps);
                 fprintf(stdout, "End cut value is larger than length of file.  Truncating to %d frames.\n", (int) endCut);
             }
         }
@@ -548,7 +519,7 @@ void DelayCut::execCLI(int argc)
             }
             if (endCut > (length * 1000.0))
             {
-                endCut = Delayac3::round(length * 1000.0);
+                endCut = delayac3->round(length * 1000.0);
                 fprintf(stdout, "End cut value is larger than length of file.  Truncating to %d milliseconds.\n", (int) endCut);
             }
         }
@@ -574,32 +545,68 @@ void DelayCut::execCLI(int argc)
 void DelayCut::keyPressEvent(QKeyEvent* event)
 {
     if (ui->processButton->isEnabled() && event->key() == Qt::Key_Return)
+    {
         on_processButton_clicked();
-
-    if (ui->abortButton->isEnabled() && event->key() == Qt::Key_Escape)
-        on_abortButton_clicked();
+    }
+    if (event->key() == Qt::Key_Escape)
+    {
+        on_quitButton_clicked();
+    }
 }
 
 void DelayCut::execute()
 {
+#ifndef Q_OS_WIN
+    outputFile = fopen(outFileName.toUtf8().constData(),"wb");
+#else
+    outputFile = _wfopen(outFileName.toStdWString().c_str(), L"wb");
+#endif
+    if (!outputFile)
+    {
+        onProcessingFinished(false);
+        return;
+    }
+
+#ifndef Q_OS_WIN
+    inputFile = fopen(inFileName.toUtf8().constData(),"rb");
+#else
+    inputFile = _wfopen(inFileName.toStdWString().c_str(), L"rb");
+#endif
+    if (!inputFile)
+    {
+        fclose(outputFile);
+        onProcessingFinished(false);
+        return;
+    }
+
+#ifndef Q_OS_WIN
+    logFile = fopen(logFileName.toUtf8().constData(),"a");
+#else
+    logFile = _wfopen(logFileName.toStdWString().c_str(), L"a");
+#endif
+    if (!logFile)
+    {
+        fclose(outputFile);
+        fclose(inputFile);
+        onProcessingFinished(false);
+        return;
+    }
+
     QString extension = QFileInfo(inFileName).suffix();
+
+    delayac3->SetDelayValues(inputFile, outputFile, logFile, fileInfo, isCLI, &abort, crcMode, writeConsole, extension);
 
     if (!isCLI)
     {
-        Delayac3* delayac3 = new Delayac3(inFileName, outFileName, logFileName, fileInfo, isCLI, crcMode, writeConsole);
         delayac3->moveToThread(workerThread);
-        connect(delayac3, SIGNAL(UpdateProgress(qint32)), this, SLOT(onUpdateProgress(qint32)));
-        connect(delayac3, SIGNAL(ProcessingFinished(bool, bool)), this, SLOT(onProcessingFinished(bool, bool)));
-        connect( workerThread, SIGNAL(started()), delayac3, SLOT(delayFile()));
-        connect( delayac3, SIGNAL(ProcessingFinished(bool, bool)), workerThread, SLOT(quit()));
-        connect( delayac3, SIGNAL(ProcessingFinished(bool, bool)), delayac3, SLOT(deleteLater()));
+        connect(workerThread, SIGNAL(started()), delayac3, SLOT(delayFile()));
+        connect(delayac3, SIGNAL(ProcessingFinished(bool)), workerThread, SLOT(quit()));
 
         workerThread->start();
     }
     else
     {
-        Delayac3 delayac3(inFileName, outFileName, logFileName, fileInfo, isCLI, crcMode, writeConsole);
-        delayac3.delayFile();
+        delayac3->delayFile();
     }
 }
 
@@ -708,12 +715,12 @@ void DelayCut::on_inputFileLineEdit_textChanged(const QString &fileName)
                 {
                     fps = ui->fpsLineEdit->text().toDouble();
                 }
-                startDelay = Delayac3::round((delay / 1000.0) * fps);
+                startDelay = delayac3->round((delay / 1000.0) * fps);
                 ui->startDelayLineEdit->setText(QString::number(startDelay));
             }
             else if (currentInputMode == "audioframes")
             {
-                startDelay = Delayac3::round(delay / fileInfo->dFrameduration);
+                startDelay = delayac3->round(delay / fileInfo->dFrameduration);
                 ui->startDelayLineEdit->setText(QString::number((int) startDelay));
             }
             else
@@ -757,11 +764,35 @@ void DelayCut::SetOutputPath(QString fileName)
 
 void DelayCut::GetInputFileInfo()
 {
-    if (fileInfo->type == "unknown")
-        return;
+    if (fileInfo->type == "unknown") return;
+#ifndef Q_OS_WIN
+    inputFile = fopen(inFileName.toUtf8().constData(),"rb");
+#else
+    inputFile = _wfopen(inFileName.toStdWString().c_str(), L"rb");
+#endif
+    QString extension = QFileInfo(inFileName).suffix().toLower();
 
-    if( !Delayac3::getFileInfo(inFileName, fileInfo))
-        return;
+    if (extension == "wav")
+    {
+        delayac3->getwavinfo(inputFile, fileInfo);
+    }
+    if (extension == "ac3")
+    {
+        delayac3->getac3info(inputFile, fileInfo);
+    }
+    if (extension == "eac3" || extension == "ddp" || extension == "ec3" || extension == "dd+")
+    {
+        delayac3->geteac3info(inputFile, fileInfo);
+    }
+    if (extension == "dts")
+    {
+        delayac3->getdtsinfo(inputFile, fileInfo);
+    }
+    if (extension == "mpa" || extension == "mp2" || extension == "mp3")
+    {
+        delayac3->getmpainfo(inputFile, fileInfo);
+    }
+    fclose(inputFile);
 
     ui->infoTextEdit->clear();
     ui->infoTextEdit->insertPlainText(QString("====== INPUT FILE INFO ===============\n"));
@@ -797,7 +828,7 @@ void DelayCut::GetInputFileInfo()
 
     if (fileInfo->type != "wav")
     {
-        ui->infoTextEdit->insertPlainText(QString("Bytes per Frame   %1\n").arg(fileInfo->dBytesperframe, 9, 'L', 4));
+        ui->infoTextEdit->insertPlainText(QString("Bytes per Frame    %1\n").arg(fileInfo->dBytesperframe, 9, 'L', 4));
     }
     else
     {
@@ -825,7 +856,7 @@ void DelayCut::CalculateTarget()
 {
     if (fileInfo->type == "unknown") return;
 
-    qreal calcStartCut, calcEndCut, calcStartDelay, calcEndDelay, calcStartSilence, calcLengthSilence;
+    qreal calcStartCut, calcEndCut, calcStartDelay, calcEndDelay;
 
     calcStartCut = calcEndCut = calcStartDelay = calcEndDelay = 0.0;
     QString extension = QFileInfo(inFileName).suffix().toLower();
@@ -895,8 +926,8 @@ void DelayCut::CalculateTarget()
 
     if (currentInputMode == "videoframes")
     {
-        calcStartDelay = Delayac3::round((startDelay / fps) * 1000.0);
-        calcEndDelay = Delayac3::round((endDelay / fps) * 1000.0);
+        calcStartDelay = delayac3->round((startDelay / fps) * 1000.0);
+        calcEndDelay = delayac3->round((endDelay / fps) * 1000.0);
     }
     else if (currentInputMode == "seconds")
     {
@@ -905,8 +936,8 @@ void DelayCut::CalculateTarget()
     }
     else if (currentInputMode == "audioframes")
     {
-        calcStartDelay = Delayac3::round(startDelay * fileInfo->dFrameduration);
-        calcEndDelay = Delayac3::round(endDelay * fileInfo->dFrameduration);
+        calcStartDelay = delayac3->round(startDelay * fileInfo->dFrameduration);
+        calcEndDelay = delayac3->round(endDelay * fileInfo->dFrameduration);
     }
     else
     {
@@ -914,37 +945,14 @@ void DelayCut::CalculateTarget()
         calcEndDelay = endDelay;
     }
 
-    if (currentInputMode == "videoframes")
-    {
-        calcStartSilence = Delayac3::round((startSilence / fps) * 1000.0);
-        calcLengthSilence = Delayac3::round((lengthSilence / fps) * 1000.0);
-    }
-    else if (currentInputMode == "seconds")
-    {
-        calcStartSilence = startSilence * 1000.0;
-        calcLengthSilence = lengthSilence * 1000.0;
-    }
-    else if (currentInputMode == "audioframes")
-    {
-        calcStartSilence = Delayac3::round(startSilence * fileInfo->dFrameduration);
-        calcLengthSilence = Delayac3::round(lengthSilence * fileInfo->dFrameduration);
-    }
-    else
-    {
-        calcStartSilence = startSilence;
-        calcLengthSilence = lengthSilence;
-    }
-    
-    Delayac3::gettargetinfo(fileInfo, calcStartDelay, calcEndDelay, calcStartCut, calcEndCut, calcStartSilence, calcLengthSilence);
+    delayac3->gettargetinfo(fileInfo, calcStartDelay, calcEndDelay, calcStartCut, calcEndCut);
 
     ui->infoTextEdit->insertPlainText(QString("====== TARGET FILE INFO ==============\n"));
-    ui->infoTextEdit->insertPlainText(QString("Start %1          %2\n").arg(fileInfo->type == "wav" ? "Sample" : "Frame ").arg(fileInfo->i64StartFrame));
-    ui->infoTextEdit->insertPlainText(QString("End %1            %2\n").arg(fileInfo->type == "wav" ? "Sample" : "Frame ").arg(fileInfo->i64EndFrame));
-    ui->infoTextEdit->insertPlainText(QString("Silence start %1  %2\n").arg(fileInfo->type == "wav" ? "Sample" : "Frame ").arg(fileInfo->i64StartSilenceFrame));
-    ui->infoTextEdit->insertPlainText(QString("Silence length %1 %2\n").arg(fileInfo->type == "wav" ? "Sample" : "Frame ").arg(fileInfo->i64LengthSilenceFrame));
-    ui->infoTextEdit->insertPlainText(QString("Num of %1        %2\n").arg(fileInfo->type == "wav" ? "Samples" : "Frames ").arg((fileInfo->i64EndFrame - fileInfo->i64StartFrame) + fileInfo->i64LengthSilenceFrame + 1));
-    ui->infoTextEdit->insertPlainText(QString("Duration              %1\n").arg(fileInfo->csTimeLengthEst));
-    ui->infoTextEdit->insertPlainText(QString("NotFixedDelay         %1\n").arg(fileInfo->dNotFixedDelay, 5, 'f', 4));
+    ui->infoTextEdit->insertPlainText(QString("Start %1       %2\n").arg(fileInfo->type == "wav" ? "Sample" : "Frame ").arg(fileInfo->i64StartFrame));
+    ui->infoTextEdit->insertPlainText(QString("End %1         %2\n").arg(fileInfo->type == "wav" ? "Sample" : "Frame ").arg(fileInfo->i64EndFrame));
+    ui->infoTextEdit->insertPlainText(QString("Num of %1     %2\n").arg(fileInfo->type == "wav" ? "Samples" : "Frames ").arg((fileInfo->i64EndFrame - fileInfo->i64StartFrame) + 1));
+    ui->infoTextEdit->insertPlainText(QString("Duration           %1\n").arg(fileInfo->csTimeLengthEst));
+    ui->infoTextEdit->insertPlainText(QString("NotFixedDelay      %1\n").arg(fileInfo->dNotFixedDelay, 5, 'f', 4));
     ui->infoTextEdit->insertPlainText("======================================\n");
 }
 
@@ -1111,42 +1119,6 @@ void DelayCut::on_endDelayLineEdit_textEdited(const QString &inEndDelay)
     }
 }
 
-void DelayCut::on_startSilenceLineEdit_textEdited(const QString &inInsertSilenceStart)
-{
-    if (ui->startSilenceLineEdit->text().isEmpty())
-    {
-        ui->startSilenceLineEdit->setText("0");
-        startSilence = 0;
-    }
-    else
-    {
-        startSilence = inInsertSilenceStart.toDouble();
-    }
-    if (!inFileName.isEmpty())
-    {
-        GetInputFileInfo();
-        CalculateTarget();
-    }
-}
-
-void DelayCut::on_lengthSilenceLineEdit_textEdited(const QString &inInsertSilenceLength)
-{
-    if (ui->lengthSilenceLineEdit->text().isEmpty())
-    {
-        ui->lengthSilenceLineEdit->setText("0");
-        lengthSilence = 0;
-    }
-    else
-    {
-        lengthSilence = inInsertSilenceLength.toDouble();
-    }
-    if (!inFileName.isEmpty())
-    {
-        GetInputFileInfo();
-        CalculateTarget();
-    }
-}
-
 void DelayCut::on_cutFileCheckBox_toggled(bool checked)
 {
     isCut = checked;
@@ -1216,10 +1188,10 @@ void DelayCut::on_processButton_clicked()
 
 void DelayCut::on_abortButton_clicked()
 {
-    workerThread->requestInterruption();
+    abort = true;
 }
 
-void DelayCut::onProcessingFinished(bool success, bool abort)
+void DelayCut::onProcessingFinished(bool success)
 {
     if (abort)
     {
@@ -1231,6 +1203,7 @@ void DelayCut::onProcessingFinished(bool success, bool abort)
         else
         {
             QMessageBox::information(this, "Info", "Aborted!");
+            abort = false;
         }
     }
     else if (success)
@@ -1345,8 +1318,6 @@ qint32 DelayCut::logTargetInfo(QString fileName, QString extension)
             fprintf(logFile, "[Target info]\n");
             fprintf(logFile, "%s", QString("StartFrame=%1\n").arg(fileInfo->i64StartFrame).toUtf8().constData());
             fprintf(logFile, "%s", QString("EndFrame=%1\n").arg(fileInfo->i64EndFrame).toUtf8().constData());
-            fprintf(logFile, "%s", QString("SilenceStartFrame=%1\n").arg(fileInfo->i64StartSilenceFrame).toUtf8().constData());
-            fprintf(logFile, "%s", QString("SilenceLengthFrame=%1\n").arg(fileInfo->i64LengthSilenceFrame).toUtf8().constData());
             fprintf(logFile, "%s", QString("NotFixedDelay=%1\n").arg(fileInfo->dNotFixedDelay, 8, 'f', 4).toUtf8().constData());
             fprintf(logFile, "%s", QString("Duration=%1\n").arg(fileInfo->csTimeLengthEst).toUtf8().constData());
         }
@@ -1355,8 +1326,6 @@ qint32 DelayCut::logTargetInfo(QString fileName, QString extension)
             fprintf(logFile, "[Target info]\n");
             fprintf(logFile, "%s", QString("StartSample=%1\n").arg(fileInfo->i64StartFrame).toUtf8().constData());
             fprintf(logFile, "%s", QString("EndSample=%1\n").arg(fileInfo->i64EndFrame).toUtf8().constData());
-            fprintf(logFile, "%s", QString("SilenceStartSample=%1\n").arg(fileInfo->i64StartSilenceFrame).toUtf8().constData());
-            fprintf(logFile, "%s", QString("SilenceLengthSample=%1\n").arg(fileInfo->i64LengthSilenceFrame).toUtf8().constData());
             fprintf(logFile, "%s", QString("NotFixedDelay=%1\n").arg(fileInfo->dNotFixedDelay, 8, 'f', 4).toUtf8().constData());
             fprintf(logFile, "%s", QString("Duration=%1\n").arg(fileInfo->csTimeLengthEst).toUtf8().constData());
         }
@@ -1365,11 +1334,10 @@ qint32 DelayCut::logTargetInfo(QString fileName, QString extension)
     }
 }
 
-void DelayCut::on_inputUnitsComboBox_textActivated(const QString &itemText)
+void DelayCut::on_inputUnitsComboBox_activated(const QString &itemText)
 {
-    QString startLabel, endLabel, lengthLabel;
+    QString startLabel, endLabel;
     qint32 maxLength;
-    bool fpsEnabled;
 
     if (ui->fpsLineEdit->text().contains("/"))
     {
@@ -1383,53 +1351,39 @@ void DelayCut::on_inputUnitsComboBox_textActivated(const QString &itemText)
 
     if (currentInputMode == "seconds")
     {
-        startCut = Delayac3::round(startCut * 1000.0);
-        endCut = Delayac3::round(endCut * 1000.0);
-        startDelay = Delayac3::round(startDelay * 1000.0);
-        endDelay = Delayac3::round(endDelay * 1000.0);
-        startSilence = Delayac3::round(startSilence * 1000.0);
-        lengthSilence = Delayac3::round(lengthSilence * 1000.0);
+        startCut = delayac3->round(startCut * 1000.0);
+        endCut = delayac3->round(endCut * 1000.0);
+        startDelay = delayac3->round(startDelay * 1000.0);
+        endDelay = delayac3->round(endDelay * 1000.0);
     }
     else if (currentInputMode == "videoframes")
     {
-        startCut = Delayac3::round((startCut / fps) * 1000.0);
-        endCut = Delayac3::round((endCut / fps) * 1000.0);
-        startDelay = Delayac3::round((startDelay / fps) * 1000.0);
-        endDelay = Delayac3::round((endDelay / fps) * 1000.0);
-        startSilence = Delayac3::round((startSilence / fps) * 1000.0);
-        lengthSilence = Delayac3::round((lengthSilence / fps) * 1000.0);
+        startCut = delayac3->round((startCut / fps) * 1000.0);
+        endCut = delayac3->round((endCut / fps) * 1000.0);
+        startDelay = delayac3->round((startDelay / fps) * 1000.0);
+        endDelay = delayac3->round((endDelay / fps) * 1000.0);
     }
     else if (currentInputMode == "audioframes")
     {
         if (startCut != 0)
         {
-            startCut = Delayac3::round(startCut * fileInfo->dFrameduration);
+            startCut = delayac3->round(startCut * fileInfo->dFrameduration);
         }
         if (endCut != 0)
         {
-            endCut = Delayac3::round(endCut * fileInfo->dFrameduration);
+            endCut = delayac3->round(endCut * fileInfo->dFrameduration);
         }
         if (startDelay != 0)
         {
-            startDelay = Delayac3::round(startDelay * fileInfo->dFrameduration);
+            startDelay = delayac3->round(startDelay * fileInfo->dFrameduration);
         }
         if (endDelay != 0)
         {
-            endDelay = Delayac3::round(endDelay * fileInfo->dFrameduration);
-        }
-        if (startSilence != 0)
-        {
-            startSilence = Delayac3::round(startSilence * fileInfo->dFrameduration);
-        }
-        if (lengthSilence != 0)
-        {
-            lengthSilence = Delayac3::round(lengthSilence * fileInfo->dFrameduration);
+            endDelay = delayac3->round(endDelay * fileInfo->dFrameduration);
         }
     }
 
-    fpsEnabled = (itemText == "Video frames");
-    ui->fpsLabel->setEnabled(fpsEnabled);
-    ui->fpsLineEdit->setEnabled(fpsEnabled);
+    ui->fpsLineEdit->setEnabled(itemText == "Video frames");
 
     if (itemText == "Seconds")
     {
@@ -1437,15 +1391,12 @@ void DelayCut::on_inputUnitsComboBox_textActivated(const QString &itemText)
         cutValidator = new QDoubleValidator(-99999.999, 99999.999, 3, this);
         startLabel = "Start (sec)";
         endLabel = "End (sec)";
-        lengthLabel = "Length (sec)";
         maxLength = 10;
         currentInputMode = "seconds";
         startCut /= 1000.0;
         endCut /= 1000.0;
         startDelay /= 1000.0;
         endDelay /= 1000.0;
-        startSilence /= 1000.0;
-        lengthSilence /= 1000.0;
     }
     else
     {
@@ -1457,20 +1408,16 @@ void DelayCut::on_inputUnitsComboBox_textActivated(const QString &itemText)
         {
             startLabel = "Start (frames)";
             endLabel = "End (frames)";
-            lengthLabel = "Length (frames)";
             currentInputMode = "videoframes";
-            startCut = Delayac3::round(fps * (startCut / 1000.0));
-            endCut = Delayac3::round(fps * (endCut / 1000.0));
-            startDelay = Delayac3::round(fps * (startDelay / 1000.0));
-            endDelay = Delayac3::round(fps * (endDelay / 1000.0));
-            startSilence = Delayac3::round(fps * (startSilence / 1000.0));
-            lengthSilence = Delayac3::round(fps * (lengthSilence / 1000.0));
+            startCut = delayac3->round(fps * (startCut / 1000.0));
+            endCut = delayac3->round(fps * (endCut / 1000.0));
+            startDelay = delayac3->round(fps * (startDelay / 1000.0));
+            endDelay = delayac3->round(fps * (endDelay / 1000.0));
         }
         else if (itemText == "Audio frames")
         {
             startLabel = "Start (frames)";
             endLabel = "End (frames)";
-            lengthLabel = "Length (frames)";
             currentInputMode = "audioframes";
             if (inFileName.isEmpty())
             {
@@ -1478,19 +1425,16 @@ void DelayCut::on_inputUnitsComboBox_textActivated(const QString &itemText)
             }
             else
             {
-                startCut = Delayac3::round(startCut / fileInfo->dFrameduration);
-                endCut = Delayac3::round(endCut / fileInfo->dFrameduration);
-                startDelay = Delayac3::round(startDelay / fileInfo->dFrameduration);
-                endDelay = Delayac3::round(endDelay / fileInfo->dFrameduration);
-                startSilence = Delayac3::round(startSilence / fileInfo->dFrameduration);
-                lengthSilence = Delayac3::round(lengthSilence / fileInfo->dFrameduration);
+                startCut = delayac3->round(startCut / fileInfo->dFrameduration);
+                endCut = delayac3->round(endCut / fileInfo->dFrameduration);
+                startDelay = delayac3->round(startDelay / fileInfo->dFrameduration);
+                endDelay = delayac3->round(endDelay / fileInfo->dFrameduration);
             }
         }
         else if (itemText == "Milliseconds")
         {
             startLabel = "Start (msec)";
             endLabel = "End (msec)";
-            lengthLabel = "Length (msec)";
             currentInputMode = "milliseconds";
         }
     }
@@ -1515,17 +1459,6 @@ void DelayCut::on_inputUnitsComboBox_textActivated(const QString &itemText)
     ui->endDelayLineEdit->setValidator(delayValidator);
     ui->endDelayLineEdit->setText(itemText == "Video frames" || itemText == "Milliseconds" || itemText == "Audio frames" ? QString::number((int) endDelay)
                                                                                                                          : QString::number(endDelay, 'f', 3));
-    ui->startSilenceLabel->setText(startLabel);
-    ui->startSilenceLineEdit->setMaxLength(maxLength);
-    ui->startSilenceLineEdit->setValidator(cutValidator);
-    ui->startSilenceLineEdit->setText(itemText == "Video frames" || itemText == "Milliseconds" || itemText == "Audio frames" ? QString::number((int) startSilence)
-                                                                                                                                   : QString::number(startSilence, 'f', 3));
-    ui->lengthSilenceLabel->setText(lengthLabel);
-    ui->lengthSilenceLineEdit->setMaxLength(maxLength);
-    ui->lengthSilenceLineEdit->setValidator(cutValidator);
-    ui->lengthSilenceLineEdit->setText(itemText == "Video frames" || itemText == "Milliseconds" || itemText == "Audio frames" ? QString::number((int) lengthSilence)
-                                                                                                                                    : QString::number(lengthSilence, 'f', 3));
-
     if (!inFileName.isEmpty())
     {
         GetInputFileInfo();

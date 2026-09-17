@@ -27,6 +27,13 @@
 #include <cstdio>
 #include <math.h>
 
+// macOS has no separate 64-bit stat API: off_t and struct stat are always 64-bit there,
+// and the macOS 27 SDK no longer declares stat64/fstat64
+#if defined(__APPLE__)
+#define stat64 stat
+#define fstat64 fstat
+#endif
+
 #define NUMREAD 8
 #define MAXBYTES_PER_FRAME 2*1280
 #define MAXLOGERRORS 100

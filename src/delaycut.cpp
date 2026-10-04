@@ -477,7 +477,7 @@ void DelayCut::execCLI(int argc)
                 fprintf(stderr, "Start cut value is larger than length of file.\n");
                 exit(EXIT_FAILURE);
             }
-            checkVal = endCut * fps;
+            checkVal = endCut / fps;
             if (checkVal > length)
             {
                 endCut = delayac3->round(length * fps);
